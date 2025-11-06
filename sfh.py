@@ -3,6 +3,7 @@ from bs4 import BeautifulSoup
 import json
 import os
 from urllib.parse import urljoin
+from collections import defaultdict
 
 # Конфигурация
 AUTH_FILE = "auth.json"
@@ -40,13 +41,11 @@ def create_session():
 def login(session, creds):
     print("🔐 Авторизация...")
     
-    # Извлекаем логин (поддержка "id" и "login")
     user_id = creds.get("id") or creds.get("login") or ""
     password = creds.get("password") or creds.get("pass") or ""
 
-    # ✅ Правильные поля формы:
     payload = {
-        "id": user_id,          # ← КЛЮЧЕВОЕ: именно "id"
+        "id": user_id,          # ← КЛЮЧЕВОЕ: "id", а не "login"
         "password": password,
         "submit": "Войти"
     }
@@ -61,18 +60,14 @@ def login(session, creds):
     print(f"← Статус: {r.status_code}")
     print(f"🍪 Cookies после входа: {dict(session.cookies)}")
 
-    # Успешный вход: есть PHPSESSID
     if session.cookies.get("PHPSESSID"):
         print("✅ Успешный вход!")
         return True
 
-    # Или: в теле нет "регистрация" и "вход"
     text = r.text.strip()
     if "регистрация" in text and "вход" in text:
-        print("❌ Сервер вернул форму входа — проверьте логин/пароль.")
+        print("❌ Форма входа — проверьте логин/пароль.")
         return False
-
-    # Или: редирект на главную/расписание
     if "logout" in text or "Выход" in text:
         print("✅ Успешный вход (по тексту)!")
         return True
@@ -97,7 +92,7 @@ def get_page(session, m, d):
 
     text = r.text.strip()
     if "регистрация" in text and "вход" in text:
-        print("⚠️ Сессия устарела — требуется повторный вход.")
+        print("⚠️ Сессия устарела.")
         return None, url
 
     return r.text, url
@@ -202,18 +197,17 @@ def main():
     session = create_session()
 
     if not login(session, creds):
-        print("\n🔄 Повторный вход (очищаем старые данные)...")
+        print("\n🔄 Повторный вход...")
         if os.path.exists(AUTH_FILE):
             os.remove(AUTH_FILE)
             print(f"🗑️ Удалён старый {AUTH_FILE}")
-        # Повторный ввод
         user_id = input("Повторите логин: ").strip()
         password = input("Повторите пароль: ").strip()
         creds = {"id": user_id, "password": password}
         save_auth(creds)
         session = create_session()
         if not login(session, creds):
-            print("🛑 Вход не удался. Проверьте данные вручную на сайте.")
+            print("🛑 Вход не удался.")
             return
 
     d = input("\nДень (например 6): ").strip()
@@ -248,7 +242,7 @@ def main():
     for i, p in enumerate(pairs, 1):
         print(f"Пара {i} (zid={p[0]['zid']})")
 
-    sel_str = input("\n→ Выбор (1, 1.2, 1-3, 0 и т.д.): ").strip()
+    sel_str = input("\n→ Введите пары/часы (пример: 1.1 2 3-4 0):\n").strip()
     sel = parse_selection(sel_str, len(pairs))
     selected = get_selected_hours(pairs, sel)
     if not selected:
@@ -261,31 +255,60 @@ def main():
     print("0 — нет | 1 — мед.справка | 2 — общественная | 3 — дежурство | 4 — объяснительная")
     reason = input("Тип причины (по умолчанию 0): ").strip() or "0"
 
-    # ✅ Отправка
+    # === Группируем по парам для красивого вывода ===
+    hours_by_zid = defaultdict(list)
+    zid_to_pair_num = {}
+    for i, pair in enumerate(pairs, 1):
+        zid = pair[0]["zid"]
+        zid_to_pair_num[zid] = i
+        for h in pair:
+            if h in selected:
+                hours_by_zid[zid].append(h)
+
     session.headers["Referer"] = page_url
     session.headers["X-Requested-With"] = "XMLHttpRequest"
 
-    print(f"\n📤 Отправка на: {page_url}")
+    print(f"\n📤 Отправка...")
     success = 0
-    for h in selected:
-        payload = {
-            "userid": h["userid"],
-            "zid": h["zid"],
-            "hour": h["hour"],
-            "nb": "on",       # ← "on", а не "1"
-            "type": reason,
-            "reason": ""
-        }
+    results = []
 
-        try:
-            r = session.post(page_url, data=payload, timeout=10)
-            if r.status_code == 200:
-                print(f"✅ Час {h['hour']} (zid={h['zid']}) — OK")
-                success += 1
+    for zid, hours in hours_by_zid.items():
+        statuses = []
+        for h in hours:
+            payload = {
+                "userid": h["userid"],
+                "zid": h["zid"],
+                "hour": h["hour"],
+                "nb": "on",
+                "type": reason,
+                "reason": ""
+            }
+            try:
+                r = session.post(page_url, data=payload, timeout=10)
+                ok = (r.status_code == 200)
+                statuses.append(ok)
+                if ok:
+                    success += 1
+            except:
+                statuses.append(False)
+        results.append((zid_to_pair_num[zid], hours, statuses))
+
+    # === Вывод по парам (как ты просил) ===
+    print()
+    for pair_num, hours, statuses in results:
+        total = len(hours)
+        ok_count = sum(statuses)
+
+        if total == 1:
+            hour_num = hours[0]["hour"]
+            status_mark = "✅ OK" if statuses[0] else "❌ ERROR"
+            print(f"Пара {pair_num} — {hour_num} час {status_mark}")
+        else:
+            if ok_count == total:
+                status_mark = "✅ OK"
             else:
-                print(f"❌ Час {h['hour']} — {r.status_code}")
-        except Exception as e:
-            print(f"⚠️ Ошибка: {e}")
+                status_mark = f"✅ {ok_count}/{total}"
+            print(f"Пара {pair_num} — все часы ({total}) {status_mark}")
 
     print(f"\n🎉 Готово! Успешно: {success} из {len(selected)}")
 
